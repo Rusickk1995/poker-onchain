@@ -3,29 +3,15 @@ name = "poker-onchain"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+linera-sdk = { version = "0.15.6", default-features = false }
+async-graphql = { version = "7", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+poker-engine = { path = "../linera-poker" }
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[dependencies]
-linera-sdk = "0.15.6"
-linera-views = "0.15.6"        # ← ДОБАВИЛИ ЭТО
-serde = { version = "1.0", features = ["derive"] }
-
-# Наш оффчейн покерный движок
-poker-engine = { path = "../linera-poker" }
-
-# GraphQL для сервиса
-async-graphql = "7.0.17"
-
-futures = "0.3"
-
-[dev-dependencies]
-tokio = { version = "1.40", features = ["rt", "sync"] }
-
-[[bin]]
-name = "poker_onchain_contract"
-path = "src/contract.rs"
-
-[[bin]]
-name = "poker_onchain_service"
-path = "src/service.rs"
