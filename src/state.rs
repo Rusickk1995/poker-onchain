@@ -1,24 +1,22 @@
 use std::collections::HashMap;
 
 use linera_sdk::linera_base_types::AccountOwner;
-use linera_sdk::views::{
-    MapView, RegisterView, RootView, ViewStorageContext,
-};
+use linera_sdk::views::{MapView, RegisterView, RootView, ViewStorageContext};
 use serde::{Deserialize, Serialize};
 
+// Всё берём из off-chain движка: домен + engine.
+// On-chain ничего из этого не реализует, только хранит снимки.
 use poker_engine::domain::chips::Chips;
 use poker_engine::domain::deck::Deck;
 use poker_engine::domain::table::Table;
 use poker_engine::domain::tournament::Tournament;
-use poker_engine::domain::{
-    HandId, PlayerId, SeatIndex, TableId, TournamentId,
-};
+use poker_engine::domain::{HandId, PlayerId, SeatIndex, TableId, TournamentId};
 use poker_engine::engine::betting::BettingState;
 use poker_engine::engine::game_loop;
 use poker_engine::engine::hand_history::HandHistory;
 use poker_engine::engine::pot::Pot;
 use poker_engine::engine::side_pots::SidePot;
-
+use poker_engine::time_ctrl::TimeController;
 
 /// Полный снапшот HandEngine для хранения в Chain View.
 ///
@@ -123,4 +121,11 @@ pub struct PokerState {
     /// Обратная привязка: аккаунт → player_id.
     #[view(map)]
     pub account_players: MapView<AccountOwner, PlayerId>,
+
+    /// Тайм-контроллеры (shot-clock + таймбанк) по столам.
+    ///
+    /// Тут хранится `TimeController` из off-chain модуля `time_ctrl` —
+    /// полностью сериализуемая структура (Serialize/Deserialize).
+    #[view(map)]
+    pub time_controllers: MapView<TableId, TimeController>,
 }
