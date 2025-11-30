@@ -45,6 +45,7 @@ use poker_engine::infra::rng_seed::RngSeed;
 use poker_engine::time_ctrl::{AutoActionDecision, TimeController, TimeProfile};
 
 use crate::{HandEngineSnapshot, PokerState};
+use std::collections::HashMap;
 
 /// Ошибки on-chain уровня (storage, авторизация, валидация команд, турнирные ошибки).
 #[derive(Debug, Error)]
@@ -989,22 +990,234 @@ impl<'a> PokerOrchestrator<'a> {
         Ok(CommandResponse::TournamentState(view))
     }
 
-    /// Хук, вызываемый после завершения раздачи на турнирном столе.
-    /// Здесь можно:
-    /// - отмечать bust игроков;
-    /// - делать rebalance столов;
-    /// - авто-завершать турнир, когда остался один.
+        /// Хук, вызываемый после завершения раздачи на турнирном столе.
+    ///
+    /// Здесь мы:
+    /// 1) синхронизируем Tournament с реальным состоянием столов (стеки, места);
+    /// 2) отмечаем bust игроков с нулевым стеком;
+    /// 3) считаем и применяем ребалансировку столов (compute_rebalance_moves);
+    /// 4) физически пересаживаем игроков между столами;
+    /// 5) чистим пустые столы и обновляем tournament_tables.
     async fn handle_tournament_after_hand(
         &mut self,
         tournament_id: TournamentId,
         _table: &Table,
     ) -> OnchainResult<()> {
-        let _tournament = self
-            .load_tournament(tournament_id)
-            .await?;
-        // Сейчас — no-op, чтобы не ломать твою доменную логику.
+        // 1. Загружаем турнир и проверяем статус.
+        let mut tournament = self.load_tournament(tournament_id).await?;
+
+        if tournament.status != TournamentStatus::Running {
+            // В регистрационной, паузе или после завершения — ничего не делаем.
+            return Ok(());
+        }
+
+        // 2. Берём список столов турнира.
+        let table_ids = self
+            .state
+            .tournament_tables
+            .get(&tournament_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .unwrap_or_default();
+
+        if table_ids.is_empty() {
+            // Нет столов, но турнир почему-то Running — не ломаемся, просто выходим.
+            return Ok(());
+        }
+
+        // 3. Грузим все столы турнира в память.
+        let mut tables: HashMap<TableId, Table> = HashMap::new();
+
+        for tid in &table_ids {
+            if let Some(table) = self
+                .state
+                .tables
+                .get(tid)
+                .await
+                .map_err(|e| OnchainError::Storage(e.to_string()))?
+            {
+                tables.insert(*tid, table);
+            }
+        }
+
+        if tables.is_empty() {
+            // Столы не нашлись в storage — защитный выход.
+            return Ok(());
+        }
+
+        // 4. Строим карту: player_id -> (table_id, seat_index, stack).
+        let mut player_locations: HashMap<PlayerId, (TableId, SeatIndex, Chips)> =
+            HashMap::new();
+
+        for (tid, table) in tables.iter() {
+            for (idx, seat_opt) in table.seats.iter().enumerate() {
+                if let Some(p) = seat_opt {
+                    player_locations.insert(
+                        p.player_id,
+                        (*tid, idx as SeatIndex, p.stack),
+                    );
+                }
+            }
+        }
+
+        // 5. Синхронизируем Tournament.registrations со стеками/местами
+        //    и собираем кандидатов на bust (stack == 0).
+        let mut busted_candidates: Vec<PlayerId> = Vec::new();
+
+        for (player_id, reg) in tournament.registrations.iter_mut() {
+            if reg.is_busted {
+                continue;
+            }
+
+            if let Some((tid, seat, stack)) = player_locations.get(player_id) {
+                // Игрок реально сидит за каким-то столом — синхронизируем данные.
+                reg.table_id = Some(*tid);
+                reg.seat_index = Some(*seat);
+                reg.total_chips = *stack;
+
+                // Нулевой стек → кандидат на вылет.
+                if stack.is_zero() {
+                    busted_candidates.push(*player_id);
+                }
+            } else if reg.total_chips.is_zero() {
+                // Игрок нигде не сидит и у него 0 фишек — считаем вылетевшим.
+                busted_candidates.push(*player_id);
+            }
+        }
+
+        // 6. Отмечаем bust в Tournament + убираем игроков со столов.
+        for player_id in busted_candidates.into_iter() {
+            // Убираем игрока со стола, если он там ещё числится.
+            if let Some((tid, seat, _stack)) = player_locations.get(&player_id).copied() {
+                if let Some(table) = tables.get_mut(&tid) {
+                    if let Some(slot) = table.seats.get_mut(seat as usize) {
+                        *slot = None;
+                    }
+                }
+            }
+
+            // Помечаем вылет в доменной модели турнира.
+            if let Err(err) = tournament.mark_player_busted(player_id) {
+                match err {
+                    // Защитный кейс: домен не даёт выбить последнего живого игрока.
+                    TournamentError::CannotBustLastPlayer { .. } => {
+                        // Просто игнорируем этот конкретный вызов.
+                    }
+                    other => {
+                        return Err(OnchainError::Tournament(other));
+                    }
+                }
+            }
+        }
+
+        // После возможных вылетов домен сам проверит,
+        // не нужно ли завершить турнир (check_and_finish_if_needed внутри).
+
+        // 7. Считаем ребалансировку столов по доменной логике.
+        let moves = tournament.compute_rebalance_moves();
+
+        if !moves.is_empty() {
+            // Карта: player_id -> новый seat_index (по факту, как посадили за стол).
+            let mut new_seats: HashMap<PlayerId, SeatIndex> = HashMap::new();
+
+            // 7.1. Физически пересаживаем игроков между столами (таблицы в памяти).
+            for m in &moves {
+                // Считываем исходный стол.
+                let from_table_opt = tables.get_mut(&m.from_table);
+                if from_table_opt.is_none() {
+                    continue;
+                }
+                let from_table = from_table_opt.unwrap();
+
+                // Ищем игрока на исходном столе.
+                let mut moved_player: Option<PlayerAtTable> = None;
+                for (idx, seat_opt) in from_table.seats.iter_mut().enumerate() {
+                    if let Some(p) = seat_opt {
+                        if p.player_id == m.player_id {
+                            moved_player = Some(p.clone());
+                            *seat_opt = None;
+                            break;
+                        }
+                    }
+                }
+
+                let moved_player = match moved_player {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                // Садим игрока на целевой стол в первое свободное место.
+                if let Some(to_table) = tables.get_mut(&m.to_table) {
+                    if let Some((seat_idx, slot)) = to_table
+                        .seats
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, s)| s.is_none())
+                    {
+                        *slot = Some(moved_player);
+                        new_seats.insert(m.player_id, seat_idx as SeatIndex);
+                    }
+                }
+            }
+
+            // 7.2. Обновляем логическое состояние турнира (table_id / seat_index).
+            tournament.apply_rebalance_moves(&moves);
+
+            // В apply_rebalance_moves seat_index сбрасывается в None.
+            // Здесь мы проставляем фактические места по тем переносам,
+            // которые реально смогли выполнить на столах.
+            for (player_id, seat_index) in new_seats.into_iter() {
+                if let Some(reg) = tournament.registrations.get_mut(&player_id) {
+                    reg.seat_index = Some(seat_index);
+                }
+            }
+        }
+
+        // 8. Чистим пустые столы и сохраняем обновлённые.
+        let mut new_table_ids: Vec<TableId> = Vec::new();
+
+        for (tid, table) in tables.into_iter() {
+            if table.seated_count() == 0 {
+                // Полностью пустой стол — убираем из стораджа и индексов турнира.
+                self.state
+                    .tables
+                    .remove(&tid)
+                    .map_err(|e| OnchainError::Storage(e.to_string()))?;
+                self.state
+                    .active_hands
+                    .remove(&tid)
+                    .map_err(|e| OnchainError::Storage(e.to_string()))?;
+                self.state
+                    .table_tournament
+                    .remove(&tid)
+                    .map_err(|e| OnchainError::Storage(e.to_string()))?;
+                self.state
+                    .time_controllers
+                    .remove(&tid)
+                    .map_err(|e| OnchainError::Storage(e.to_string()))?;
+                continue;
+            }
+
+            // Стол живой — сохраняем его обратно.
+            self.save_table(table)?;
+            new_table_ids.push(tid);
+        }
+
+        // 9. Обновляем mapping: турнир → его столы.
+        self.state
+            .tournament_tables
+            .insert(&tournament_id, new_table_ids)
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        // 10. Сохраняем обновлённый турнир.
+        self.state
+            .tournaments
+            .insert(&tournament_id, tournament)
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
         Ok(())
     }
+
 
     // =====================================================================
     //                               HELPERS

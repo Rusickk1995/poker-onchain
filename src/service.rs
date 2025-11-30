@@ -10,24 +10,39 @@ use linera_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use poker_engine::api::dto::{PlayerAtTableDto, TableViewDto};
+use poker_engine::api::dto::{
+    PlayerAtTableDto,
+    TableViewDto,
+    TournamentViewDto,
+};
 use poker_engine::domain::table::Table;
-use poker_engine::domain::{PlayerId, SeatIndex, TableId};
+use poker_engine::domain::{
+    PlayerId,
+    SeatIndex,
+    TableId,
+    TournamentId,
+};
 
-use crate::{HandEngineSnapshot, PokerAbi, PokerState};
+use crate::{
+    HandEngineSnapshot,
+    PokerAbi,
+    PokerState,
+};
+use crate::utils::build_tournament_view;
 
-/// Read-only сервис для покерного приложения.
-///
-/// Этап 5:
-/// - поддерживаем несколько "режимов" запросов через JSON:
-///   - { "type": "summary" }  → общая статистика по приложению;
-///   - { "type": "table",  "table_id": <TableId> } → один стол (TableViewDto);
-///   - { "type": "tables" } → все столы (Vec<TableViewDto>).
-///
-/// Это соответствует GraphQL-идеям:
-///   - QueryRoot.summary
-///   - QueryRoot.table(table_id: ...) -> TableViewDto
-///   - QueryRoot.tables() -> [TableViewDto]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServiceQuery {
+    Summary,
+
+    Table { table_id: TableId },
+    Tables,
+
+    Tournaments,
+    TournamentById { tournament_id: TournamentId },
+    TournamentTables { tournament_id: TournamentId },
+}
+
 pub struct PokerService {
     pub state: PokerState,
     pub runtime: ServiceRuntime<Self>,
@@ -39,167 +54,236 @@ impl WithServiceAbi for PokerService {
     type Abi = PokerAbi;
 }
 
-/// Внутренний тип запроса сервиса.
-/// Его можно дергать напрямую JSON-ом с фронта.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServiceQuery {
-    /// Базовая статистика (суммарно по приложению).
-    Summary,
-
-    /// Запрос одного стола.
-    Table { table_id: TableId },
-
-    /// Запрос всех столов.
-    Tables,
-}
-
 impl Service for PokerService {
     type Parameters = ();
 
     async fn new(runtime: ServiceRuntime<Self>) -> Self {
-        // Загружаем PokerState так же, как в контракте.
-        let state = PokerState::load(runtime.root_view_storage_context())
-            .await
-            .expect("Failed to load PokerState for service");
+        let state =
+            PokerState::load(runtime.root_view_storage_context())
+                .await
+                .expect("Failed to load PokerState for service");
 
         PokerService { state, runtime }
     }
 
     async fn handle_query(&self, query: Value) -> Value {
-        // Пытаемся распарсить JSON в наш ServiceQuery.
-        // Если формат не совпал — по умолчанию возвращаем summary.
         let parsed: Result<ServiceQuery, _> = serde_json::from_value(query.clone());
         let request = parsed.unwrap_or(ServiceQuery::Summary);
 
         match request {
             ServiceQuery::Summary => self.handle_summary().await,
+
             ServiceQuery::Table { table_id } => self.handle_table(table_id).await,
             ServiceQuery::Tables => self.handle_tables().await,
+
+            ServiceQuery::Tournaments => self.handle_tournaments().await,
+            ServiceQuery::TournamentById { tournament_id } =>
+                self.handle_tournament_by_id(tournament_id).await,
+            ServiceQuery::TournamentTables { tournament_id } =>
+                self.handle_tournament_tables(tournament_id).await,
         }
     }
 }
 
 impl PokerService {
-    /// "summary" – базовая статистика по приложению.
     async fn handle_summary(&self) -> Value {
         let total_hands_played = *self.state.total_hands_played.get();
 
+        let tables_count =
+            self.state.tables.indices().await.unwrap_or_default().len();
+
+        let tournaments_count =
+            self.state.tournaments.indices().await.unwrap_or_default().len();
+
         serde_json::json!({
-            "total_hands_played": total_hands_played
+            "total_hands_played": total_hands_played,
+            "tables_count": tables_count,
+            "tournaments_count": tournaments_count,
         })
     }
 
-    /// "table(table_id) -> TableViewDto".
     async fn handle_table(&self, table_id: TableId) -> Value {
-        // Загружаем стол.
-        let table_opt = self
-            .state
-            .tables
-            .get(&table_id)
-            .await
-            .expect("View error (tables.get)");
-
-        let Some(table) = table_opt else {
+        let Some(table) =
+            self.state.tables.get(&table_id).await.expect("tables.get error")
+        else {
             return serde_json::json!({
                 "error": "table_not_found",
-                "table_id": table_id,
+                "table_id": table_id
             });
         };
 
-        // Загружаем активный снапшот, если есть.
-        let active_snapshot = self
+        let active = self
             .state
             .active_hands
             .get(&table_id)
             .await
-            .expect("View error (active_hands.get)")
+            .expect("active_hands.get error")
             .flatten();
 
-        let dto = build_table_view_for_service(&self.state, &table, active_snapshot.as_ref())
-            .await;
+        let dto =
+            build_table_view_for_service(&self.state, &table, active.as_ref()).await;
 
-        serde_json::to_value(dto).expect("Failed to serialize TableViewDto")
+        serde_json::to_value(dto).unwrap()
     }
 
-    /// "tables() -> [TableViewDto]".
     async fn handle_tables(&self) -> Value {
-        // ПРАВИЛЬНЫЙ API: у MapView в 0.15.6 есть indices(), а не keys().
-        let table_ids: Vec<TableId> = self
+        let ids = self
             .state
             .tables
             .indices()
             .await
-            .expect("View error (tables.indices)");
+            .expect("tables.indices error");
 
-        let mut result = Vec::<TableViewDto>::new();
+        let mut out = Vec::new();
 
-        for table_id in table_ids {
-            if let Some(table) = self
-                .state
-                .tables
-                .get(&table_id)
-                .await
-                .expect("View error (tables.get in tables())")
+        for id in ids {
+            if let Some(table) =
+                self.state.tables.get(&id).await.unwrap_or(None)
             {
-                let active_snapshot = self
+                let active = self
                     .state
                     .active_hands
-                    .get(&table_id)
+                    .get(&id)
                     .await
-                    .expect("View error (active_hands.get in tables())")
+                    .unwrap_or(None)
                     .flatten();
 
-                let dto =
-                    build_table_view_for_service(&self.state, &table, active_snapshot.as_ref())
-                        .await;
+                let dto = build_table_view_for_service(
+                    &self.state,
+                    &table,
+                    active.as_ref(),
+                )
+                .await;
 
-                result.push(dto);
+                out.push(dto);
             }
         }
 
-        serde_json::to_value(result).expect("Failed to serialize Vec<TableViewDto>")
+        serde_json::to_value(out).unwrap()
+    }
+
+    async fn handle_tournaments(&self) -> Value {
+        let ids = self
+            .state
+            .tournaments
+            .indices()
+            .await
+            .expect("tournaments.indices error");
+
+        let mut out = Vec::new();
+
+        for id in ids {
+            if let Some(t) =
+                self.state.tournaments.get(&id).await.unwrap_or(None)
+            {
+                let tables_running = self
+                    .state
+                    .tournament_tables
+                    .get(&id)
+                    .await
+                    .unwrap_or(None)
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+
+                out.push(build_tournament_view(&t, tables_running));
+            }
+        }
+
+        serde_json::to_value(out).unwrap()
+    }
+
+    async fn handle_tournament_by_id(&self, tournament_id: TournamentId) -> Value {
+        let Some(t) =
+            self.state.tournaments.get(&tournament_id).await.unwrap_or(None)
+        else {
+            return serde_json::json!({
+                "error": "tournament_not_found",
+                "tournament_id": tournament_id
+            });
+        };
+
+        let tables_running = self
+            .state
+            .tournament_tables
+            .get(&tournament_id)
+            .await
+            .unwrap_or(None)
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+
+        serde_json::to_value(build_tournament_view(&t, tables_running)).unwrap()
+    }
+
+    async fn handle_tournament_tables(
+        &self,
+        tournament_id: TournamentId,
+    ) -> Value {
+        let Some(table_ids) =
+            self.state.tournament_tables.get(&tournament_id).await.unwrap_or(None)
+        else {
+            return serde_json::json!({
+                "error": "tournament_not_found",
+                "tournament_id": tournament_id
+            });
+        };
+
+        let mut out = Vec::new();
+
+        for tid in table_ids {
+            if let Some(table) =
+                self.state.tables.get(&tid).await.unwrap_or(None)
+            {
+                let active = self
+                    .state
+                    .active_hands
+                    .get(&tid)
+                    .await
+                    .unwrap_or(None)
+                    .flatten();
+
+                let dto = build_table_view_for_service(
+                    &self.state,
+                    &table,
+                    active.as_ref(),
+                )
+                .await;
+
+                out.push(dto);
+            }
+        }
+
+        serde_json::to_value(out).unwrap()
     }
 }
 
-/// Хелпер: делаем TableViewDto так же, как в on-chain оркестраторе.
-///
-/// ВАЖНО:
-/// - Никакой логики engine, только преобразование доменной модели + snapshot → DTO.
-/// - Логика должна быть максимально идентична `PokerOrchestrator::build_table_view`,
-///   чтобы фронт видел одно и то же представление и после команд, и при чистом read-only запросе.
 async fn build_table_view_for_service(
     state: &PokerState,
     table: &Table,
     active: Option<&HandEngineSnapshot>,
 ) -> TableViewDto {
-    let current_actor_seat: Option<u8> = active
-        .and_then(|s| s.current_actor)
-        .map(|s: SeatIndex| s as u8);
+    let current_actor_seat: Option<u8> =
+        active.and_then(|s| s.current_actor).map(|s| s as u8);
 
-    let mut players: Vec<PlayerAtTableDto> = Vec::new();
+    let mut players = Vec::new();
 
-    for (idx, opt_player) in table.seats.iter().enumerate() {
-        if let Some(p) = opt_player {
-            let seat_index = idx as u8;
-            let player_id: PlayerId = p.player_id;
+    for (idx, opt) in table.seats.iter().enumerate() {
+        if let Some(p) = opt {
+            let player_id = p.player_id;
 
-            // Имя игрока для UI, если оно было сохранено.
             let display_name = state
                 .player_names
                 .get(&player_id)
                 .await
-                .expect("View error (player_names.get)")
+                .unwrap_or_else(|_| Some(format!("Player #{}", player_id)))
                 .unwrap_or_else(|| format!("Player #{}", player_id));
 
             players.push(PlayerAtTableDto {
                 player_id,
                 display_name,
-                seat_index,
+                seat_index: idx as u8,
                 stack: p.stack,
                 current_bet: p.current_bet,
                 status: p.status,
-                // Hole cards в read-only сервисе не показываем.
                 hole_cards: None,
             });
         }
@@ -213,7 +297,7 @@ async fn build_table_view_for_service(
         big_blind: table.config.stakes.big_blind,
         ante: table.config.stakes.ante,
         street: table.street,
-        dealer_button: table.dealer_button.map(|s| s as u8),
+        dealer_button: table.dealer_button.map(|b| b as u8),
         total_pot: table.total_pot,
         board: table.board.clone(),
         players,

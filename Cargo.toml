@@ -16,4 +16,4 @@ poker-engine = { path = "../linera-poker" }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-
+path = "src/lib.rs"
