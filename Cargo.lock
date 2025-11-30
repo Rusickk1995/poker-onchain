@@ -2884,6 +2884,7 @@ version = "0.1.0"
 dependencies = [
  "async-graphql",
  "linera-sdk",
+ "linera-views",
  "poker-engine",
  "serde",
  "serde_json",

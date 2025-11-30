@@ -1,20 +1,24 @@
 use std::collections::HashMap;
 
-use linera_sdk::views::{linera_views, MapView, RegisterView, RootView, ViewStorageContext};
+use linera_sdk::linera_base_types::AccountOwner;
+use linera_sdk::views::{
+    MapView, RegisterView, RootView, ViewStorageContext,
+};
 use serde::{Deserialize, Serialize};
 
-// Всё берём из off-chain движка: домен + engine.
-// On-chain ничего из этого не реализует, только хранит снимки.
 use poker_engine::domain::chips::Chips;
 use poker_engine::domain::deck::Deck;
 use poker_engine::domain::table::Table;
 use poker_engine::domain::tournament::Tournament;
-use poker_engine::domain::{HandId, PlayerId, SeatIndex, TableId, TournamentId};
+use poker_engine::domain::{
+    HandId, PlayerId, SeatIndex, TableId, TournamentId,
+};
 use poker_engine::engine::betting::BettingState;
+use poker_engine::engine::game_loop;
 use poker_engine::engine::hand_history::HandHistory;
 use poker_engine::engine::pot::Pot;
 use poker_engine::engine::side_pots::SidePot;
-use poker_engine::engine::game_loop;
+
 
 /// Полный снапшот HandEngine для хранения в Chain View.
 ///
@@ -84,11 +88,39 @@ pub struct PokerState {
     #[view(map)]
     pub tournaments: MapView<TournamentId, Tournament>,
 
+    /// Маппинг: турнир → список его столов.
+    #[view(map)]
+    pub tournament_tables: MapView<TournamentId, Vec<TableId>>,
+
+    /// Маппинг: стол → турнир (если стол турнирный).
+    #[view(map)]
+    pub table_tournament: MapView<TableId, TournamentId>,
+
     /// Глобальный счётчик раздач (для статистики / мониторинга).
     #[view(register)]
     pub total_hands_played: RegisterView<u64>,
 
+    /// Следующий hand_id для on-chain RNG/движка.
+    #[view(register)]
+    pub next_hand_id: RegisterView<u64>,
+
+    /// Базовый seed для RNG (можно задать при инстансе).
+    #[view(register)]
+    pub base_seed: RegisterView<u64>,
+
+    /// Владелец приложения (account owner), задаётся в ApplicationParameters.
+    #[view(register)]
+    pub owner: RegisterView<Option<AccountOwner>>,
+
     /// Отображаемые имена игроков для UI: PlayerId -> String.
     #[view(map)]
     pub player_names: MapView<PlayerId, String>,
+
+    /// Привязка player_id → аккаунт в Linera.
+    #[view(map)]
+    pub player_accounts: MapView<PlayerId, AccountOwner>,
+
+    /// Обратная привязка: аккаунт → player_id.
+    #[view(map)]
+    pub account_players: MapView<AccountOwner, PlayerId>,
 }

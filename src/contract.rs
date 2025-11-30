@@ -6,18 +6,15 @@ use linera_sdk::{
     Contract,
     ContractRuntime,
 };
+use linera_sdk::linera_base_types::AccountOwner;
 
 use poker_engine::api::dto::CommandResponse;
 
-use crate::{Message, Operation, PokerAbi};
+use crate::{ApplicationParameters, Message, Operation, PokerAbi};
 use crate::orchestrator::PokerOrchestrator;
 use crate::state::PokerState;
 
 /// Contract entry point для покерного приложения.
-///
-/// Здесь минимум логики:
-/// - загрузка / сохранение `PokerState`;
-/// - делегирование бизнес-логики в `PokerOrchestrator`.
 pub struct PokerContract {
     pub state: PokerState,
     pub runtime: ContractRuntime<Self>,
@@ -31,7 +28,7 @@ impl WithContractAbi for PokerContract {
 
 impl Contract for PokerContract {
     type Message = Message;
-    type Parameters = ();
+    type Parameters = ApplicationParameters;
     type InstantiationArgument = ();
     type EventValue = ();
 
@@ -44,27 +41,32 @@ impl Contract for PokerContract {
     }
 
     async fn instantiate(&mut self, _argument: Self::InstantiationArgument) {
-        // Здесь можно валидировать application parameters,
-        // owner, currency-id, лимиты и пр.
-        let _params = self.runtime.application_parameters();
+        let params: ApplicationParameters = self.runtime.application_parameters();
+
+        // Владелец обязателен.
+        self.state.owner.set(Some(params.owner));
+
+        // Базовый seed: из параметров или 1.
+        let seed = params.base_seed.unwrap_or(1);
+        self.state.base_seed.set(seed);
+
+        // Стартовый hand_id.
+        self.state.next_hand_id.set(0);
     }
 
     async fn execute_operation(&mut self, operation: Operation) -> CommandResponse {
+        let signer: Option<AccountOwner> = self.runtime.authenticated_signer();
+        let mut orchestrator = PokerOrchestrator::new(&mut self.state, signer);
+
         match operation {
-            Operation::Command(cmd) => {
-                let mut orchestrator = PokerOrchestrator::new(&mut self.state);
-                orchestrator.execute_command(cmd).await
-            }
+            Operation::Command(cmd) => orchestrator.execute_command(cmd).await,
         }
     }
 
     async fn execute_message(&mut self, _message: Self::Message) {
-        // Зарезервировано под cross-chain сообщения (например,
-        // турниры между несколькими цепями, глобальные лидерборды и т.п.).
+        // Пока не используем cross-chain сообщения.
     }
 
-    /// Здесь self передаётся ПО ЗНАЧЕНИЮ, поэтому делаем его `mut self`,
-    /// чтобы иметь право мутировать `self.state` и вызвать `save()`.
     async fn store(mut self) {
         self.state
             .save()

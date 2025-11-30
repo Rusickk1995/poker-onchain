@@ -1,142 +1,226 @@
-use std::fmt;
+use linera_sdk::linera_base_types::AccountOwner;
+use thiserror::Error;
 
-use linera_sdk::views::ViewError;
+use poker_engine::domain::hand::Street;
 
 use poker_engine::api::commands::{
+    AdjustStackCommand,
     AnteTypeApi,
     Command,
+    CreateTableCommand,
+    PlayerActionCommand,
+    SeatPlayerCommand,
+    StartHandCommand,
     TableCommand,
     TournamentCommand,
-    CreateTableCommand,
-    SeatPlayerCommand,
     UnseatPlayerCommand,
-    AdjustStackCommand,
-    StartHandCommand,
-    PlayerActionCommand,
+    CreateTournamentCommand,
+    RegisterPlayerInTournamentCommand,
+    UnregisterPlayerFromTournamentCommand,
+    StartTournamentCommand,
+    AdvanceLevelCommand,
+    CloseTournamentCommand,
 };
 use poker_engine::api::dto::{
     CommandResponse,
     PlayerAtTableDto,
     TableViewDto,
+    TournamentViewDto,
     map_hand_status_to_response,
 };
 use poker_engine::domain::blinds::AnteType;
 use poker_engine::domain::chips::Chips;
 use poker_engine::domain::player::PlayerAtTable;
 use poker_engine::domain::table::{Table, TableConfig, TableStakes, TableType};
-use poker_engine::domain::{SeatIndex, TableId};
+use poker_engine::domain::tournament::{
+    Tournament, TournamentConfig, TournamentError, TournamentStatus,
+};
+use poker_engine::domain::{PlayerId, SeatIndex, TableId, TournamentId};
 use poker_engine::engine::{self, HandStatus};
-use poker_engine::engine::errors::EngineError;
 use poker_engine::infra::rng_seed::RngSeed;
+use poker_engine::tournament::TournamentRuntime;
 
 use crate::{HandEngineSnapshot, PokerState};
 
-/// Унифицированная ошибка on-chain слоя.
-/// Все `View`/engine/логические ошибки сворачиваются сюда,
-/// а сверху маппятся в `CommandResponse::Error(...)`.
-#[derive(Debug)]
+/// Ошибки on-chain уровня (storage, авторизация, валидация команд, турнирные ошибки).
+#[derive(Debug, Error)]
 pub enum OnchainError {
-    /// Ошибка работы с View (хранилище Linera).
-    View(ViewError),
+    #[error("storage error: {0}")]
+    Storage(String),
 
-    /// Ошибка движка (engine).
-    Engine(EngineError),
+    #[error("table {0} not found")]
+    TableNotFound(TableId),
 
-    /// Команда некорректна с точки зрения бизнес-логики.
-    InvalidCommand(String),
+    #[error("tournament {0} not found")]
+    TournamentNotFound(TournamentId),
 
-    /// Несоответствие состояния (отсутствующий стол, раздача и т.п.).
-    State(String),
+    #[error("seat {seat} is not empty at table {table}")]
+    SeatNotEmpty { table: TableId, seat: SeatIndex },
 
-    /// Внутренняя ошибка, которую трудно типизировать.
-    Internal(String),
-}
+    #[error("seat {seat} is invalid at table {table}")]
+    InvalidSeatIndex { table: TableId, seat: SeatIndex },
 
-impl fmt::Display for OnchainError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OnchainError::View(e) => write!(f, "View error: {e}"),
-            OnchainError::Engine(e) => write!(f, "Engine error: {e}"),
-            OnchainError::InvalidCommand(msg) => write!(f, "Invalid command: {msg}"),
-            OnchainError::State(msg) => write!(f, "State error: {msg}"),
-            OnchainError::Internal(msg) => write!(f, "Internal error: {msg}"),
-        }
-    }
-}
+    #[error("no player at seat {seat} on table {table}")]
+    NoPlayerAtSeat { table: TableId, seat: SeatIndex },
 
-impl std::error::Error for OnchainError {}
+    #[error("hand already in progress at table {0}")]
+    HandAlreadyInProgress(TableId),
 
-impl From<ViewError> for OnchainError {
-    fn from(e: ViewError) -> Self {
-        OnchainError::View(e)
-    }
-}
+    #[error("no active hand on table {0}")]
+    NoActiveHand(TableId),
 
-impl From<EngineError> for OnchainError {
-    fn from(e: EngineError) -> Self {
-        OnchainError::Engine(e)
-    }
+    #[error("engine error: {0}")]
+    EngineError(String),
+
+    #[error("unauthenticated signer")]
+    Unauthenticated,
+
+    #[error("unauthorized (only owner/admin can do this)")]
+    Unauthorized,
+
+    #[error("player id mismatch for this signer")]
+    PlayerIdMismatch,
+
+    #[error("tournament error: {0}")]
+    Tournament(#[from] TournamentError),
+
+    #[error("tournament already exists: {0}")]
+    TournamentAlreadyExists(TournamentId),
+
+    #[error("tournament not running: {0}")]
+    TournamentNotRunning(TournamentId),
 }
 
 type OnchainResult<T> = Result<T, OnchainError>;
 
-/// Высокоуровневый оркестратор:
-/// Command (API) → изменение PokerState → CommandResponse (DTO для фронта).
-///
-/// Внутри:
-/// - работа с MapView / RegisterView;
-/// - запуск/продолжение раздач через `poker_engine::engine`;
-/// - НЕТ `panic!/expect` на пользовательских путях, только `OnchainError` → `CommandResponse::Error`.
 pub struct PokerOrchestrator<'a> {
     pub state: &'a mut PokerState,
+    pub signer: Option<AccountOwner>,
 }
 
 impl<'a> PokerOrchestrator<'a> {
-    pub fn new(state: &'a mut PokerState) -> Self {
-        Self { state }
+    pub fn new(state: &'a mut PokerState, signer: Option<AccountOwner>) -> Self {
+        Self { state, signer }
     }
 
-    /// Главная точка входа для контракта.
-    ///
-    /// Внутри работаем через Result, наружу всегда возвращаем CommandResponse:
-    /// либо нормальный ответ, либо `CommandResponse::Error(...)`.
+    /// Главная точка входа: применить high-level команду.
+    /// Внутри работаем через Result, наружу всегда возвращаем CommandResponse.
     pub async fn execute_command(&mut self, cmd: Command) -> CommandResponse {
-        match self.execute_command_inner(cmd).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                // ВАЖНО: для компиляции должен существовать вариант
-                // `CommandResponse::Error(String)` в движке (api/dto.rs).
-                CommandResponse::Error(err.to_string())
-            }
-        }
-    }
-
-    /// Вся реальная логика команд — через `OnchainResult`.
-    async fn execute_command_inner(&mut self, cmd: Command) -> OnchainResult<CommandResponse> {
-        match cmd {
+        let result: OnchainResult<CommandResponse> = match cmd {
             Command::CreateTable(c) => self.handle_create_table(c).await,
             Command::TableCommand(tc) => self.handle_table_command(tc).await,
-            Command::TournamentCommand(tc) => self.handle_tournament_command(tc).await,
+            Command::TournamentCommand(tc) => {
+                self.handle_tournament_command(tc).await
+            }
+        };
+
+        match result {
+            Ok(resp) => resp,
+            Err(err) => self.error_response(err),
         }
     }
 
-    // ======================= TABLE LIFECYCLE (CASH) =======================
+    /// Преобразование OnchainError → CommandResponse.
+    /// Пока отдаём "специальный" TableViewDto с сообщением об ошибке в name.
+    fn error_response(&self, err: OnchainError) -> CommandResponse {
+            let table = TableViewDto {
+            table_id: 0,
+            name: format!("ERROR: {err}"),
+            max_seats: 0,
+            small_blind: Chips(0),
+            big_blind: Chips(0),
+            ante: Chips(0),
+            // Любой базовый стрит, который есть в твоём enum Street.
+            street: Street::Preflop,
+            dealer_button: None,
+            total_pot: Chips(0),
+            board: Vec::new(),
+            players: Vec::new(),
+            hand_in_progress: false,
+            current_actor_seat: None,
+        };
+
+
+        CommandResponse::TableState(table)
+    }
+
+    // =====================================================================
+    //                         ВСПОМОГАТЕЛЬНАЯ АВТОРИЗАЦИЯ
+    // =====================================================================
+
+    async fn app_owner(&self) -> Option<AccountOwner> {
+        *self.state.owner.get()
+    }
+
+    async fn ensure_admin(&self) -> OnchainResult<()> {
+        let signer = self.signer.ok_or(OnchainError::Unauthenticated)?;
+        let owner = self
+            .app_owner()
+            .await
+            .ok_or(OnchainError::Unauthorized)?;
+
+        if signer != owner {
+            return Err(OnchainError::Unauthorized);
+        }
+
+        Ok(())
+    }
+
+    /// Привязать signer ↔ player_id (один раз) и проверять соответствие.
+    async fn ensure_player_for_signer(
+        &mut self,
+        player_id: PlayerId,
+    ) -> OnchainResult<PlayerId> {
+        let signer = self.signer.ok_or(OnchainError::Unauthenticated)?;
+
+        if let Some(existing) = self
+            .state
+            .account_players
+            .get(&signer)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+        {
+            if existing != player_id {
+                return Err(OnchainError::PlayerIdMismatch);
+            }
+            Ok(existing)
+        } else {
+            // Первая привязка.
+            self.state
+                .account_players
+                .insert(&signer, player_id)
+                .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+            self.state
+                .player_accounts
+                .insert(&player_id, signer)
+                .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+            Ok(player_id)
+        }
+    }
+
+    // =====================================================================
+    //                           CASH / TABLE COMMANDS
+    // =====================================================================
 
     async fn handle_create_table(
         &mut self,
         cmd: CreateTableCommand,
     ) -> OnchainResult<CommandResponse> {
-        // Защита от двойного создания одного и того же стола.
-        let existing = self
+        // Admin-only.
+        self.ensure_admin().await?;
+
+        if self
             .state
             .tables
             .get(&cmd.table_id)
             .await
-            .map_err(OnchainError::from)?;
-
-        if existing.is_some() {
-            return Err(OnchainError::InvalidCommand(format!(
-                "CreateTable: table {} already exists",
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .is_some()
+        {
+            return Err(OnchainError::Storage(format!(
+                "table {} already exists",
                 cmd.table_id
             )));
         }
@@ -158,17 +242,15 @@ impl<'a> PokerOrchestrator<'a> {
 
         let table = Table::new(cmd.table_id, cmd.name.clone(), config);
 
-        // Сохраняем стол.
         self.state
             .tables
             .insert(&cmd.table_id, table.clone())
-            .map_err(OnchainError::from)?;
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
 
-        // Инициализируем слот для активной раздачи (пока None).
         self.state
             .active_hands
             .insert(&cmd.table_id, None)
-            .map_err(OnchainError::from)?;
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
 
         let table_view = self.build_table_view(&table, None).await?;
 
@@ -192,32 +274,36 @@ impl<'a> PokerOrchestrator<'a> {
         &mut self,
         cmd: SeatPlayerCommand,
     ) -> OnchainResult<CommandResponse> {
+        // Привязываем signer ↔ player_id.
+        let player_id = self.ensure_player_for_signer(cmd.player_id).await?;
+
         let mut table = self.load_table(cmd.table_id).await?;
         let seat: SeatIndex = cmd.seat_index as SeatIndex;
 
         if !table.is_seat_empty(seat) {
-            return Err(OnchainError::InvalidCommand(format!(
-                "SeatPlayer: seat {} is not empty at table {}",
-                seat, table.id
-            )));
+            return Err(OnchainError::SeatNotEmpty {
+                table: table.id,
+                seat,
+            });
         }
 
-        let pat = PlayerAtTable::new(cmd.player_id, cmd.initial_stack);
+        let pat = PlayerAtTable::new(player_id, cmd.initial_stack);
 
         if let Some(slot) = table.seats.get_mut(seat as usize) {
             *slot = Some(pat);
         } else {
-            return Err(OnchainError::InvalidCommand(format!(
-                "SeatPlayer: invalid seat index {} for table {}",
-                seat, table.id
-            )));
+            return Err(OnchainError::InvalidSeatIndex {
+                table: table.id,
+                seat,
+            });
         }
 
-        // Читаемое имя игрока для UI.
-        self.state
-            .player_names
-            .insert(&cmd.player_id, cmd.display_name.clone())
-            .map_err(OnchainError::from)?;
+        if !cmd.display_name.is_empty() {
+            self.state
+                .player_names
+                .insert(&player_id, cmd.display_name.clone())
+                .map_err(|e| OnchainError::Storage(e.to_string()))?;
+        }
 
         self.save_table(table.clone())?;
 
@@ -239,10 +325,10 @@ impl<'a> PokerOrchestrator<'a> {
         if let Some(slot) = table.seats.get_mut(seat as usize) {
             *slot = None;
         } else {
-            return Err(OnchainError::InvalidCommand(format!(
-                "UnseatPlayer: invalid seat index {} for table {}",
-                seat, table.id
-            )));
+            return Err(OnchainError::InvalidSeatIndex {
+                table: table.id,
+                seat,
+            });
         }
 
         self.save_table(table.clone())?;
@@ -259,6 +345,9 @@ impl<'a> PokerOrchestrator<'a> {
         &mut self,
         cmd: AdjustStackCommand,
     ) -> OnchainResult<CommandResponse> {
+        // Admin-only.
+        self.ensure_admin().await?;
+
         let mut table = self.load_table(cmd.table_id).await?;
         let seat: SeatIndex = cmd.seat_index as SeatIndex;
 
@@ -276,10 +365,10 @@ impl<'a> PokerOrchestrator<'a> {
                 }
             }
         } else {
-            return Err(OnchainError::InvalidCommand(format!(
-                "AdjustStack: no player at seat {} on table {}",
-                seat, table.id
-            )));
+            return Err(OnchainError::NoPlayerAtSeat {
+                table: table.id,
+                seat,
+            });
         }
 
         self.save_table(table.clone())?;
@@ -299,40 +388,36 @@ impl<'a> PokerOrchestrator<'a> {
         let mut table = self.load_table(cmd.table_id).await?;
 
         if table.hand_in_progress {
-            return Err(OnchainError::InvalidCommand(format!(
-                "StartHand: hand already in progress at table {}",
-                table.id
-            )));
+            return Err(OnchainError::HandAlreadyInProgress(table.id));
         }
 
-        // Детерминированный RNG: derive(global_seed, table_id, hand_id).
-        // TODO: вынести `base_seed` в PokerState, чтобы конфигурировать seed per app.
-        let base_seed = RngSeed::from_u64(1);
-        let derived_seed = base_seed.derive(table.id, cmd.hand_id, cmd.hand_id);
-        let mut rng = derived_seed.to_rng();
+        // Берём hand_id из глобального счётчика.
+        let current_id = *self.state.next_hand_id.get();
+        let hand_id = current_id + 1;
+        self.state.next_hand_id.set(hand_id);
 
-        let new_hand_id = cmd.hand_id;
+        let base_seed = *self.state.base_seed.get();
+        let seed = RngSeed::from_u64(base_seed ^ hand_id ^ table.id as u64);
+        let mut rng = seed.to_rng();
 
-        let engine = engine::start_hand(&mut table, &mut rng, new_hand_id)
-            .map_err(OnchainError::from)?;
+        let mut engine =
+            engine::start_hand(&mut table, &mut rng, hand_id).map_err(|e| {
+                OnchainError::EngineError(format!("start_hand failed: {e:?}"))
+            })?;
 
-        // Увеличиваем глобальный счётчик раздач.
-        let current_total = *self.state.total_hands_played.get();
-        self.state
-            .total_hands_played
-            .set(current_total.saturating_add(1));
+        let total = *self.state.total_hands_played.get();
+        self.state.total_hands_played.set(total.saturating_add(1));
 
-        // Сохраняем снапшот.
         let snapshot = HandEngineSnapshot::from_engine(&engine);
         self.state
             .active_hands
-            .insert(&table.id, Some(snapshot))
-            .map_err(OnchainError::from)?;
+            .insert(&table.id, Some(snapshot.clone()))
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
 
         self.save_table(table.clone())?;
 
         let table_view = self
-            .build_table_view(&table, Some(&HandEngineSnapshot::from_engine(&engine)))
+            .build_table_view(&table, Some(&snapshot))
             .await?;
 
         Ok(CommandResponse::TableState(table_view))
@@ -344,125 +429,581 @@ impl<'a> PokerOrchestrator<'a> {
     ) -> OnchainResult<CommandResponse> {
         let mut table = self.load_table(cmd.table_id).await?;
 
-        // Достаём snapshot для этого стола.
-        let slot_opt = self
+        let slot = self
             .state
             .active_hands
             .get(&cmd.table_id)
             .await
-            .map_err(OnchainError::from)?;
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .ok_or(OnchainError::NoActiveHand(cmd.table_id))?;
 
-        let slot = slot_opt.ok_or_else(|| {
-            OnchainError::State(format!(
-                "PlayerAction: no active_hands entry found for table {}",
-                cmd.table_id
-            ))
-        })?;
-
-        let snapshot = slot.ok_or_else(|| {
-            OnchainError::State(format!(
-                "PlayerAction: no active hand snapshot for table {}",
-                cmd.table_id
-            ))
-        })?;
+        let snapshot = slot.ok_or(OnchainError::NoActiveHand(cmd.table_id))?;
 
         let mut engine = snapshot.into_engine();
 
-        // Применяем action в движке.
         let mut status =
             engine::apply_action(&mut table, &mut engine, cmd.action.clone())
-                .map_err(OnchainError::from)?;
+                .map_err(|e| {
+                    OnchainError::EngineError(format!(
+                        "apply_action failed: {e:?}"
+                    ))
+                })?;
 
-        // Пытаемся авто-двинуть улицу / завершить раздачу.
         if let Ok(next_status) = engine::advance_if_needed(&mut table, &mut engine) {
             status = next_status;
         }
 
-        // Обновлённый snapshot и view.
         let snapshot_after = HandEngineSnapshot::from_engine(&engine);
         let table_view = self
             .build_table_view(&table, Some(&snapshot_after))
             .await?;
 
-        match status {
+        let response = match status {
             HandStatus::Ongoing => {
-                // Раздача продолжается — сохраняем обновлённый снапшот.
                 self.state
                     .active_hands
                     .insert(&table.id, Some(snapshot_after))
-                    .map_err(OnchainError::from)?;
+                    .map_err(|e| OnchainError::Storage(e.to_string()))?;
 
                 self.save_table(table.clone())?;
-
-                Ok(CommandResponse::TableState(table_view))
+                CommandResponse::TableState(table_view)
             }
             finished_status => {
-                // Раздача закончена — очищаем active_hands.
                 self.state
                     .active_hands
                     .insert(&table.id, None)
-                    .map_err(OnchainError::from)?;
+                    .map_err(|e| OnchainError::Storage(e.to_string()))?;
 
                 self.save_table(table.clone())?;
 
-                // map_hand_status_to_response уже есть в DTO-слое движка.
-                Ok(map_hand_status_to_response(finished_status, table_view))
+                // Если это турнирный стол — обновляем турнирное состояние.
+                if let Some(tournament_id) =
+                    self.table_tournament_id(table.id).await?
+                {
+                    self.handle_tournament_after_hand(
+                        tournament_id,
+                        &table,
+                    )
+                    .await?;
+                }
+
+                map_hand_status_to_response(finished_status, table_view)
+            }
+        };
+
+        Ok(response)
+    }
+
+    // =====================================================================
+    //                          TOURNAMENT COMMANDS
+    // =====================================================================
+
+    async fn handle_tournament_command(
+        &mut self,
+        cmd: TournamentCommand,
+    ) -> OnchainResult<CommandResponse> {
+        match cmd {
+            TournamentCommand::CreateTournament(c) => {
+                self.handle_create_tournament(c).await
+            }
+            TournamentCommand::RegisterPlayer(c) => {
+                self.handle_register_player_in_tournament(c).await
+            }
+            TournamentCommand::UnregisterPlayer(c) => {
+                self.handle_unregister_player_from_tournament(c).await
+            }
+            TournamentCommand::StartTournament(c) => {
+                self.handle_start_tournament(c).await
+            }
+            TournamentCommand::AdvanceLevel(c) => {
+                self.handle_advance_tournament_level(c).await
+            }
+            TournamentCommand::CloseTournament(c) => {
+                self.handle_close_tournament(c).await
             }
         }
     }
 
-    async fn handle_tournament_command(
+    /// Создать новый турнир.
+    ///
+    /// ВАЖНО:
+    /// - id турнира генерируем on-chain (автоинкремент по существующим id);
+    /// - фронт получает id из ответа CommandResponse::TournamentState.
+    async fn handle_create_tournament(
         &mut self,
-        _cmd: TournamentCommand,
+        cmd: CreateTournamentCommand,
     ) -> OnchainResult<CommandResponse> {
-        // На ЭТАПЕ 1 турниры on-chain НЕ реализуем.
-        // Возвращаем аккуратную ошибку, без паники и без трогания полей,
-        // которых нет в твоём TournamentCommand.
-        Err(OnchainError::Internal(
-            "TournamentCommand is not implemented on-chain yet".to_string(),
-        ))
+        self.ensure_admin().await?;
+
+        // Генерируем новый TournamentId: max(existing) + 1.
+        let existing_ids: Vec<TournamentId> = self
+            .state
+            .tournaments
+            .indices()
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+        let next_id: TournamentId = existing_ids
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        if self
+            .state
+            .tournaments
+            .get(&next_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .is_some()
+        {
+            return Err(OnchainError::TournamentAlreadyExists(next_id));
+        }
+
+        // Владелец турнира как player_id — пока просто 0 (системный),
+        // логика призов/пули у тебя внутри движка.
+        let owner_player: PlayerId = 0;
+
+        let tournament = Tournament::new(
+            next_id,
+            owner_player,
+            cmd.config.clone(),
+        )?;
+
+        // На старте статус Registering уже выставлен в Tournament::new.
+        self.state
+            .tournaments
+            .insert(&next_id, tournament.clone())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        // Пустой список столов для турнира.
+        self.state
+            .tournament_tables
+            .insert(&next_id, Vec::new())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        let view =
+            self.build_tournament_view(&tournament, Vec::new()).await?;
+
+        Ok(CommandResponse::TournamentState(view))
     }
 
-    // ============================= HELPERS =============================
+    async fn handle_register_player_in_tournament(
+        &mut self,
+        cmd: RegisterPlayerInTournamentCommand,
+    ) -> OnchainResult<CommandResponse> {
+        let player_id = self.ensure_player_for_signer(cmd.player_id).await?;
 
-    /// Загрузить стол по `TableId` или вернуть осмысленную ошибку.
-    async fn load_table(&mut self, id: TableId) -> OnchainResult<Table> {
-        let maybe_table = self
+        let mut tournament = self
+            .load_tournament(cmd.tournament_id)
+            .await?;
+
+        tournament.register_player(player_id)?;
+
+        // Обновляем имя игрока (если пришло) – пригодится во view столов.
+        if !cmd.display_name.is_empty() {
+            self.state
+                .player_names
+                .insert(&player_id, cmd.display_name.clone())
+                .map_err(|e| OnchainError::Storage(e.to_string()))?;
+        }
+
+        self.state
+            .tournaments
+            .insert(&cmd.tournament_id, tournament.clone())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        let table_ids = self
             .state
+            .tournament_tables
+            .get(&cmd.tournament_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .unwrap_or_default();
+
+        let view = self.build_tournament_view(&tournament, table_ids).await?;
+
+        Ok(CommandResponse::TournamentState(view))
+    }
+
+    async fn handle_unregister_player_from_tournament(
+        &mut self,
+        cmd: UnregisterPlayerFromTournamentCommand,
+    ) -> OnchainResult<CommandResponse> {
+        let player_id = self.ensure_player_for_signer(cmd.player_id).await?;
+
+        let mut tournament = self
+            .load_tournament(cmd.tournament_id)
+            .await?;
+
+        // Разрешаем unregister только пока статус Registering.
+        if tournament.status != TournamentStatus::Registering {
+            return Err(OnchainError::Tournament(
+                TournamentError::InvalidStatus {
+                    expected: TournamentStatus::Registering,
+                    found: tournament.status,
+                },
+            ));
+        }
+
+        if tournament
+            .registrations
+            .remove(&player_id)
+            .is_none()
+        {
+            return Err(OnchainError::Tournament(
+                TournamentError::NotRegistered {
+                    player_id,
+                    tournament_id: cmd.tournament_id,
+                },
+            ));
+        }
+
+        self.state
+            .tournaments
+            .insert(&cmd.tournament_id, tournament.clone())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        let table_ids = self
+            .state
+            .tournament_tables
+            .get(&cmd.tournament_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .unwrap_or_default();
+
+        let view = self.build_tournament_view(&tournament, table_ids).await?;
+
+        Ok(CommandResponse::TournamentState(view))
+    }
+
+    async fn handle_start_tournament(
+        &mut self,
+        cmd: StartTournamentCommand,
+    ) -> OnchainResult<CommandResponse> {
+        self.ensure_admin().await?;
+
+        let mut tournament = self
+            .load_tournament(cmd.tournament_id)
+            .await?;
+
+        // Доверяем доменной логике: стартуем турнир.
+        // Для on-chain детерминизма используем now_ts = 0.
+        tournament.start(0)?;
+
+        // Генерируем столы через TournamentRuntime.
+        // Выбираем базовый next_table_id = max(existing_tables) + 1.
+        let existing_table_ids: Vec<TableId> = self
+            .state
+            .tables
+            .indices()
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+        let next_table_id: TableId = existing_table_ids
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        let instances =
+            TournamentRuntime::build_tables_for_tournament(&tournament, next_table_id);
+
+        let mut new_table_ids = Vec::new();
+
+        for instance in instances.into_iter() {
+            let table_id = instance.table.id;
+            new_table_ids.push(table_id);
+
+            // Обновляем регистрацию игроков: table_id / seat_index / total_chips.
+            for seat in &instance.seats {
+                if let Some(reg) = tournament
+                    .registrations
+                    .get_mut(&seat.player_id)
+                {
+                    reg.table_id = Some(table_id);
+                    reg.seat_index = Some(seat.seat_index as SeatIndex);
+                    reg.total_chips = seat.stack;
+                }
+            }
+
+            // Сохраняем сам стол и метаданные в state.
+            self.state
+                .tables
+                .insert(&table_id, instance.table.clone())
+                .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+            self.state
+                .active_hands
+                .insert(&table_id, None)
+                .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+            self.state
+                .table_tournament
+                .insert(&table_id, cmd.tournament_id)
+                .map_err(|e| OnchainError::Storage(e.to_string()))?;
+        }
+
+        // Сохраняем обновлённый турнир и список его столов.
+        self.state
+            .tournaments
+            .insert(&cmd.tournament_id, tournament.clone())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        self.state
+            .tournament_tables
+            .insert(&cmd.tournament_id, new_table_ids.clone())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        let view =
+            self.build_tournament_view(&tournament, new_table_ids).await?;
+
+        Ok(CommandResponse::TournamentState(view))
+    }
+
+    async fn handle_advance_tournament_level(
+        &mut self,
+        cmd: AdvanceLevelCommand,
+    ) -> OnchainResult<CommandResponse> {
+        self.ensure_admin().await?;
+
+        let mut tournament = self
+            .load_tournament(cmd.tournament_id)
+            .await?;
+
+        if tournament.status != TournamentStatus::Running {
+            return Err(OnchainError::TournamentNotRunning(cmd.tournament_id));
+        }
+
+        // Простая ручная логика: повышаем current_level на 1,
+        // если он не выходит за пределы blind_structure.
+        let next_level = tournament.current_level.saturating_add(1);
+        if tournament
+            .config
+            .blind_structure
+            .level_by_number(next_level)
+            .is_none()
+        {
+            // Больше уровней нет — просто возвращаем текущее состояние.
+            let table_ids = self
+                .state
+                .tournament_tables
+                .get(&cmd.tournament_id)
+                .await
+                .map_err(|e| OnchainError::Storage(e.to_string()))?
+                .unwrap_or_default();
+
+            let view =
+                self.build_tournament_view(&tournament, table_ids).await?;
+            return Ok(CommandResponse::TournamentState(view));
+        }
+
+        tournament.current_level = next_level;
+
+        // Пересчитаем stakes для этого уровня.
+        let new_blinds = tournament.current_blind_level().clone();
+
+        let table_ids = self
+            .state
+            .tournament_tables
+            .get(&cmd.tournament_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .unwrap_or_default();
+
+        for table_id in table_ids.iter().copied() {
+            if let Some(mut table) = self
+                .state
+                .tables
+                .get(&table_id)
+                .await
+                .map_err(|e| OnchainError::Storage(e.to_string()))?
+            {
+                table.config.stakes = TableStakes::new(
+                    new_blinds.small_blind,
+                    new_blinds.big_blind,
+                    new_blinds.ante_type,
+                    new_blinds.ante,
+                );
+                self.save_table(table)?;
+            }
+        }
+
+        self.state
+            .tournaments
+            .insert(&cmd.tournament_id, tournament.clone())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        let view = self.build_tournament_view(&tournament, table_ids).await?;
+        Ok(CommandResponse::TournamentState(view))
+    }
+
+    async fn handle_close_tournament(
+        &mut self,
+        cmd: CloseTournamentCommand,
+    ) -> OnchainResult<CommandResponse> {
+        self.ensure_admin().await?;
+
+        let mut tournament = self
+            .load_tournament(cmd.tournament_id)
+            .await?;
+
+        tournament.status = TournamentStatus::Finished;
+
+        self.state
+            .tournaments
+            .insert(&cmd.tournament_id, tournament.clone())
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        let table_ids = self
+            .state
+            .tournament_tables
+            .get(&cmd.tournament_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .unwrap_or_default();
+
+        let view = self.build_tournament_view(&tournament, table_ids).await?;
+        Ok(CommandResponse::TournamentState(view))
+    }
+
+    /// Хук, который вызывается после завершения раздачи на турнирном столе.
+    ///
+    /// Здесь:
+    /// - синхронизируем стеки игроков из всех столов турнира в Tournament.registrations;
+    /// - помечаем bust игроков (total_chips == 0);
+    /// - если остался один игрок, турнир завершится через Tournament::check_and_finish_if_needed().
+    async fn handle_tournament_after_hand(
+        &mut self,
+        tournament_id: TournamentId,
+        last_table: &Table,
+    ) -> OnchainResult<()> {
+        let mut tournament = self
+            .load_tournament(tournament_id)
+            .await?;
+
+        if tournament.status != TournamentStatus::Running {
+            return Ok(());
+        }
+
+        // Получаем список всех турнирных столов.
+        let table_ids = self
+            .state
+            .tournament_tables
+            .get(&tournament_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .unwrap_or_default();
+
+        // Сбрасываем накопленные стеки и посадку.
+        for reg in tournament.registrations.values_mut() {
+            reg.total_chips = Chips(0);
+            reg.table_id = None;
+            reg.seat_index = None;
+        }
+
+        // Пробегаем по всем столам турнира и пересчитываем total_chips.
+        for table_id in table_ids.iter().copied() {
+            let table = if table_id == last_table.id {
+                last_table.clone()
+            } else {
+                self.load_table(table_id).await?
+            };
+
+            for (seat_idx, seat_opt) in table.seats.iter().enumerate() {
+                if let Some(p) = seat_opt {
+                    if let Some(reg) =
+                        tournament.registrations.get_mut(&p.player_id)
+                    {
+                        reg.total_chips += p.stack;
+                        reg.table_id = Some(table.id);
+                        reg.seat_index = Some(seat_idx as SeatIndex);
+                    }
+                }
+            }
+        }
+
+        // Вычисляем bust-игроков: total_chips == 0.
+        let busted_ids: Vec<PlayerId> = tournament
+            .registrations
+            .values()
+            .filter(|r| !r.is_busted && r.total_chips.0 == 0)
+            .map(|r| r.player_id)
+            .collect();
+
+        for pid in busted_ids {
+            let _place = tournament.mark_player_busted(pid)?;
+        }
+
+        // Tournament сам внутри check_and_finish_if_needed завершит турнир,
+        // если останется 0 или 1 активный игрок (см. доменную логику).
+        tournament.check_and_finish_if_needed();
+
+        self.state
+            .tournaments
+            .insert(&tournament_id, tournament)
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    // =====================================================================
+    //                               HELPERS
+    // =====================================================================
+
+    async fn load_table(&mut self, id: TableId) -> OnchainResult<Table> {
+        self.state
             .tables
             .get(&id)
             .await
-            .map_err(OnchainError::from)?;
-
-        maybe_table.ok_or_else(|| OnchainError::State(format!("Table {} not found", id)))
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .ok_or(OnchainError::TableNotFound(id))
     }
 
-    /// Сохранить `Table` обратно в `tables` MapView.
     fn save_table(&mut self, table: Table) -> OnchainResult<()> {
         let id = table.id;
         self.state
             .tables
             .insert(&id, table)
-            .map_err(OnchainError::from)
+            .map_err(|e| OnchainError::Storage(e.to_string()))
     }
 
-    /// Загрузить текущий активный снапшот раздачи (если есть).
     async fn load_active_snapshot(
         &self,
         table_id: TableId,
     ) -> OnchainResult<Option<HandEngineSnapshot>> {
-        let v = self
-            .state
-            .active_hands
+        let opt = self.state.active_hands
             .get(&table_id)
             .await
-            .map_err(OnchainError::from)?;
+            .map_err(|e| OnchainError::Storage(e.to_string()))?;
 
-        Ok(v.flatten())
+        Ok(opt.flatten())
     }
 
-    /// Собрать `TableViewDto` из доменного `Table` + опционального снапшота раздачи.
-    async fn build_table_view(
+
+    async fn table_tournament_id(
+        &self,
+        table_id: TableId,
+    ) -> OnchainResult<Option<TournamentId>> {
+        self.state
+            .table_tournament
+            .get(&table_id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))
+    }
+
+    async fn load_tournament(
+        &mut self,
+        id: TournamentId,
+    ) -> OnchainResult<Tournament> {
+        self.state
+            .tournaments
+            .get(&id)
+            .await
+            .map_err(|e| OnchainError::Storage(e.to_string()))?
+            .ok_or(OnchainError::TournamentNotFound(id))
+    }
+
+    /// Собрать TableViewDto из доменного Table + опционального снапшота раздачи.
+    pub async fn build_table_view(
         &self,
         table: &Table,
         active: Option<&HandEngineSnapshot>,
@@ -483,7 +1024,7 @@ impl<'a> PokerOrchestrator<'a> {
                     .player_names
                     .get(&player_id)
                     .await
-                    .map_err(OnchainError::from)?
+                    .map_err(|e| OnchainError::Storage(e.to_string()))?
                     .unwrap_or_else(|| format!("Player #{}", player_id));
 
                 players.push(PlayerAtTableDto {
@@ -493,7 +1034,6 @@ impl<'a> PokerOrchestrator<'a> {
                     stack: p.stack,
                     current_bet: p.current_bet,
                     status: p.status,
-                    // Hole cards здесь намеренно не раскрываем.
                     hole_cards: None,
                 });
             }
@@ -513,6 +1053,21 @@ impl<'a> PokerOrchestrator<'a> {
             players,
             hand_in_progress: table.hand_in_progress,
             current_actor_seat,
+        })
+    }
+
+    async fn build_tournament_view(
+        &self,
+        tournament: &Tournament,
+        table_ids: Vec<TableId>,
+    ) -> OnchainResult<TournamentViewDto> {
+        Ok(TournamentViewDto {
+            tournament_id: tournament.id,
+            name: tournament.config.name.clone(),
+            status: format!("{:?}", tournament.status),
+            current_level: tournament.current_level,
+            players_registered: tournament.registrations.len() as u32,
+            tables_running: table_ids.len() as u32,
         })
     }
 }
