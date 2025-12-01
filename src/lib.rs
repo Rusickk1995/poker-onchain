@@ -3,12 +3,11 @@
 pub mod state;
 pub mod orchestrator;
 pub mod utils;
-// pub mod ui_tournament_config;
 
+use async_graphql::{Request, Response};
 use linera_sdk::abi::{ContractAbi, ServiceAbi};
 use linera_sdk::linera_base_types::AccountOwner;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use poker_engine::api::commands::Command;
 use poker_engine::api::dto::CommandResponse;
@@ -40,9 +39,11 @@ impl ContractAbi for PokerAbi {
     type Response = CommandResponse;
 }
 
+/// Внутренний GraphQL ABI для сервиса.
+/// Query = GraphQL-запрос, QueryResponse = GraphQL-ответ.
 impl ServiceAbi for PokerAbi {
-    type Query = Value;
-    type QueryResponse = Value;
+    type Query = Request;
+    type QueryResponse = Response;
 }
 
 /// Удобный реэкспорт состояния.
