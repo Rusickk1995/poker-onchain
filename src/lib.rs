@@ -2,10 +2,8 @@
 
 pub mod state;
 pub mod orchestrator;
-pub mod contract;
-pub mod service;
 pub mod utils;
-
+// pub mod ui_tournament_config;
 
 use linera_sdk::abi::{ContractAbi, ServiceAbi};
 use linera_sdk::linera_base_types::AccountOwner;

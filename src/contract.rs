@@ -10,9 +10,9 @@ use linera_sdk::linera_base_types::AccountOwner;
 
 use poker_engine::api::dto::CommandResponse;
 
-use crate::{ApplicationParameters, Message, Operation, PokerAbi};
-use crate::orchestrator::PokerOrchestrator;
-use crate::state::PokerState;
+use poker_onchain::{ApplicationParameters, Message, Operation, PokerAbi};
+use poker_onchain::orchestrator::PokerOrchestrator;
+use poker_onchain::state::PokerState;
 
 /// Contract entry point для покерного приложения.
 pub struct PokerContract {

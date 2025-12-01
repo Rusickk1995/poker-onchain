@@ -23,12 +23,13 @@ use poker_engine::domain::{
     TournamentId,
 };
 
-use crate::{
+use poker_onchain::{
     HandEngineSnapshot,
     PokerAbi,
     PokerState,
 };
-use crate::utils::build_tournament_view;
+use poker_onchain::utils::build_tournament_view;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
